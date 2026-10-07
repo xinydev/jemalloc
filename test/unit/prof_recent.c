@@ -1,5 +1,7 @@
 #include "test/jemalloc_test.h"
 
+#include "test/extent_hooks.h"
+
 #include "jemalloc/internal/prof_recent.h"
 
 extern edata_t *prof_recent_alloc_edata_get_no_lock_test(
@@ -112,7 +114,7 @@ TEST_END
 /* Reproducible sequence of request sizes */
 #define NTH_REQ_SIZE(n) ((n) * 97 + 101)
 
-static void
+static prof_recent_t *
 confirm_malloc(void *p) {
 	assert_ptr_not_null(p, "malloc failed unexpectedly");
 	edata_t *e = emap_edata_lookup(TSDN_NULL, &arena_emap_global, p);
@@ -124,6 +126,7 @@ confirm_malloc(void *p) {
 	expect_ptr_eq(e, prof_recent_alloc_edata_get_no_lock_test(n),
 	    "edata pointer in record is not correct");
 	expect_ptr_null(n->dalloc_tctx, "dalloc_tctx in record should be NULL");
+	return n;
 }
 
 static void
@@ -579,6 +582,274 @@ TEST_END
 #undef DUMP_ERROR
 #undef DUMP_OUT_SIZE
 
+static unsigned
+prof_recent_arena_create(void) {
+	extent_hooks_prep();
+	extent_hooks_t *new_hooks = &hooks;
+	unsigned        arena;
+	size_t          sz = sizeof(arena);
+	assert_d_eq(mallctl("arenas.create", &arena, &sz, &new_hooks,
+	    sizeof(new_hooks)), 0, "Failed to create arena");
+	return arena;
+}
+
+static void
+prof_recent_arena_destroy(unsigned arena) {
+	size_t mib[3];
+	size_t miblen = ARRAY_SIZE(mib);
+	assert_d_eq(mallctlnametomib("arena.0.destroy", mib, &miblen), 0,
+	    "Failed to look up arena.destroy");
+	mib[1] = arena;
+	assert_d_eq(mallctlbymib(mib, miblen, NULL, NULL, NULL, 0), 0,
+	    "Failed to destroy arena");
+}
+
+TEST_BEGIN(test_prof_recent_realloc_failure) {
+	test_skip_if(!config_prof);
+	confirm_prof_setup();
+	unsigned arena = prof_recent_arena_create();
+	int      flags = MALLOCX_ARENA(arena) | MALLOCX_TCACHE_NONE;
+	tsdn_t  *tsdn = tsd_tsdn(tsd_fetch());
+	for (unsigned sampled = 0; sampled < 2; sampled++) {
+		char          *p = malloc(7);
+		prof_recent_t *record = confirm_malloc(p);
+		size_t         old_usize = sallocx(p, 0);
+		p[0] = 0x5a;
+		prof_active_set(tsdn, sampled != 0);
+		/* An empty arena with allocation disabled cannot grow p. */
+		try_alloc = false;
+		called_alloc = false;
+		void *q = rallocx(p, SC_LARGE_MINCLASS, flags);
+		try_alloc = true;
+		prof_active_set(tsdn, true);
+		assert_ptr_null(q, "Expected realloc failure");
+		expect_true(called_alloc, "Expected extent allocation attempt");
+		expect_zu_eq(sallocx(p, 0), old_usize,
+		    "Old size changed on failure");
+		expect_d_eq(p[0], 0x5a, "Old contents changed on failure");
+		expect_ptr_eq(confirm_malloc(p), record,
+		    "Failed realloc lost the old recent record");
+		expect_true(nstime_equals_zero(&record->dalloc_time),
+		    "Failed realloc recorded a deallocation time");
+		free(p);
+		confirm_record_released(record);
+	}
+	prof_recent_arena_destroy(arena);
+	confirm_prof_setup();
+}
+TEST_END
+
+TEST_BEGIN(test_prof_recent_realloc_success) {
+	test_skip_if(!config_prof);
+	confirm_prof_setup();
+	unsigned arena = prof_recent_arena_create();
+	int      flags = MALLOCX_ARENA(arena) | MALLOCX_TCACHE_NONE;
+	tsdn_t  *tsdn = tsd_tsdn(tsd_fetch());
+	const struct {
+		size_t size;
+		size_t new_size;
+		bool   in_place;
+		bool   realign;
+	} cases[] = {
+		{7, 17, false, false},
+		{SC_LARGE_MINCLASS, SC_LARGE_MINCLASS, true, false},
+		{SC_LARGE_MINCLASS, 2 * SC_LARGE_MINCLASS, false, false},
+		{SC_LARGE_MINCLASS, 7, false, false},
+		{7, 17, false, true},
+	};
+	for (unsigned sampled = 0; sampled < 2; sampled++) {
+		for (unsigned i = 0; i < ARRAY_SIZE(cases); i++) {
+			void          *p = mallocx(cases[i].size, flags);
+			prof_recent_t *record = confirm_malloc(p);
+			int            realloc_flags = flags;
+			if (cases[i].realign) {
+				/* Force the pointer to move for alignment. */
+				size_t alignment = PROF_SAMPLE_ALIGNMENT;
+				while (((uintptr_t)p & (alignment - 1)) == 0) {
+					alignment *= 2;
+				}
+				realloc_flags |= MALLOCX_ALIGN(alignment);
+			}
+			prof_active_set(tsdn, sampled != 0);
+			/* Force large growth to use the moving path. */
+			try_merge = false;
+			void *q = rallocx(p, cases[i].new_size, realloc_flags);
+			try_merge = true;
+			prof_active_set(tsdn, true);
+			assert_ptr_not_null(q, "Unexpected realloc failure");
+			expect_b_eq(q == p, cases[i].in_place,
+			    "Unexpected realloc movement in case %u", i);
+			confirm_record_released(record);
+			if (sampled) {
+				confirm_malloc(q);
+			}
+			dallocx(q, MALLOCX_TCACHE_NONE);
+		}
+	}
+	prof_recent_arena_destroy(arena);
+	confirm_prof_setup();
+}
+TEST_END
+
+static unsigned realloc_bt_calls;
+
+static void
+realloc_shared_bt(UNUSED void **vec, unsigned *len, UNUSED unsigned max_len) {
+	*len = 0;
+	if (++realloc_bt_calls == 2) {
+		/* Evict while the allocation's context is still prepared. */
+		prof_recent_alloc_max_ctl_write(tsd_fetch(), 0);
+	}
+}
+
+TEST_BEGIN(test_prof_recent_realloc_shared_tctx) {
+	test_skip_if(!config_prof);
+	void *p = malloc(7);
+	confirm_malloc(p);
+	prof_backtrace_hook_t saved_hook = prof_backtrace_hook_get();
+	realloc_bt_calls = 0;
+	prof_backtrace_hook_set(realloc_shared_bt);
+	void *q = realloc(p, 17);
+	prof_backtrace_hook_set(saved_hook);
+	assert_ptr_not_null(q, "Realloc lost its prepared tctx");
+	expect_u_eq(realloc_bt_calls, 2, "Expected alloc and dalloc capture");
+	prof_info_t info;
+	tsd_t      *tsd = tsd_fetch();
+	prof_info_get(tsd, q, NULL, &info);
+	assert_true(prof_tctx_is_valid(info.alloc_tctx), "Missing new sample");
+	malloc_mutex_lock(tsd_tsdn(tsd), info.alloc_tctx->tdata->lock);
+	expect_u_eq(info.alloc_tctx->prepared_count, 0,
+	    "Realloc leaked a tctx preparation");
+	malloc_mutex_unlock(tsd_tsdn(tsd), info.alloc_tctx->tdata->lock);
+	prof_recent_alloc_max_ctl_write(tsd_fetch(), OPT_ALLOC_MAX);
+	free(q);
+	confirm_prof_setup();
+}
+TEST_END
+
+typedef enum {
+	realloc_keep_record,
+	realloc_evict_record,
+	realloc_rotate_record
+} realloc_record_action_t;
+
+typedef struct {
+	atomic_p_t             owner;
+	atomic_b_t             ready;
+	atomic_b_t             resume;
+	prof_backtrace_hook_t  backtrace_hook;
+	unsigned               arena;
+	realloc_record_action_t action;
+	edata_t               *edata;
+	prof_recent_t         *record;
+} realloc_pending_data_t;
+
+static realloc_pending_data_t *realloc_pending_data;
+
+static void
+realloc_pending_bt(void **vec, unsigned *len, unsigned max_len) {
+	realloc_pending_data_t *data = realloc_pending_data;
+	if (atomic_load_p(&data->owner, ATOMIC_ACQUIRE) == tsd_fetch()) {
+		atomic_store_b(&data->ready, true, ATOMIC_RELEASE);
+		while (!atomic_load_b(&data->resume, ATOMIC_ACQUIRE)) {
+			sleep_ns(1000 * 1000);
+		}
+	}
+	data->backtrace_hook(vec, len, max_len);
+}
+
+static void *
+realloc_pending_thread(void *arg) {
+	realloc_pending_data_t *data = arg;
+	tsd_t                 *tsd = tsd_fetch();
+	thd_setname(test_thread_name);
+	char *p = mallocx(7, MALLOCX_TCACHE_NONE);
+	data->record = confirm_malloc(p);
+	data->edata = emap_edata_lookup(tsd_tsdn(tsd), &arena_emap_global, p);
+	p[0] = 0x5a;
+	atomic_store_p(&data->owner, tsd, ATOMIC_RELEASE);
+	void *q = rallocx(p, SC_LARGE_MINCLASS,
+	    MALLOCX_ARENA(data->arena) | MALLOCX_TCACHE_NONE);
+	atomic_store_p(&data->owner, NULL, ATOMIC_RELEASE);
+	assert_ptr_null(q, "Expected realloc failure");
+	expect_d_eq(p[0], 0x5a, "Failed realloc changed old contents");
+	if (data->action == realloc_keep_record) {
+		confirm_record_living(data->record);
+	} else {
+		expect_ptr_null(
+		    edata_prof_recent_alloc_get_no_lock_test(data->edata),
+		    "Failed realloc resurrected an evicted record");
+	}
+	dallocx(p, MALLOCX_TCACHE_NONE);
+	return NULL;
+}
+
+TEST_BEGIN(test_prof_recent_realloc_pending) {
+	test_skip_if(!config_prof);
+	confirm_prof_setup();
+	tsd_t   *tsd = tsd_fetch();
+	unsigned arena = prof_recent_arena_create();
+	for (unsigned action = realloc_keep_record;
+	    action <= realloc_rotate_record; action++) {
+		prof_recent_alloc_max_ctl_write(tsd, 0);
+		prof_recent_alloc_max_ctl_write(tsd, 1);
+		realloc_pending_data_t data = {
+			.owner = ATOMIC_INIT(NULL),
+			.ready = ATOMIC_INIT(false),
+			.resume = ATOMIC_INIT(false),
+			.backtrace_hook = prof_backtrace_hook_get(),
+			.arena = arena,
+			.action = (realloc_record_action_t)action,
+		};
+		realloc_pending_data = &data;
+		prof_backtrace_hook_set(realloc_pending_bt);
+		try_alloc = false;
+		called_alloc = false;
+		thd_t thread;
+		thd_create(&thread, realloc_pending_thread, &data);
+		while (!atomic_load_b(&data.ready, ATOMIC_ACQUIRE)) {
+			sleep_ns(1000 * 1000);
+		}
+		/* Realloc is paused before allocation, without holding locks. */
+		call_dump();
+		const confirm_record_t expected = {7, sz_s2u(7), false};
+		confirm_record("{\"sample_interval\":1,\"recent_alloc_max\":1,"
+		    "\"recent_alloc\":[]}", &expected, 1);
+		void *replacement = NULL;
+		if (action == realloc_evict_record) {
+			prof_recent_alloc_max_ctl_write(tsd, 0);
+		} else if (action == realloc_rotate_record) {
+			replacement = malloc(17);
+			expect_ptr_eq(confirm_malloc(replacement), data.record,
+			    "Expected the old record to be recycled");
+		}
+		if (action != realloc_evict_record) {
+			/* Prevent unrelated allocations from evicting the record. */
+			prof_recent_alloc_max_ctl_write(tsd, -1);
+		}
+		atomic_store_b(&data.resume, true, ATOMIC_RELEASE);
+		thd_join(thread, NULL);
+		try_alloc = true;
+		prof_backtrace_hook_set(data.backtrace_hook);
+		realloc_pending_data = NULL;
+		expect_true(called_alloc, "Expected extent allocation attempt");
+		if (replacement != NULL) {
+			confirm_malloc(replacement);
+			free(replacement);
+		} else if (action == realloc_keep_record) {
+			confirm_record_released(data.record);
+		} else {
+			expect_true(ql_empty(&prof_recent_alloc_list),
+			    "Failed realloc restored a deleted record");
+		}
+	}
+	prof_recent_alloc_max_ctl_write(tsd, 0);
+	prof_recent_alloc_max_ctl_write(tsd, OPT_ALLOC_MAX);
+	prof_recent_arena_destroy(arena);
+	confirm_prof_setup();
+}
+TEST_END
+
 #define N_THREADS 8
 #define N_PTRS 512
 #define N_CTLS 8
@@ -615,6 +886,14 @@ f_thread(void *arg) {
 		assert(data_p->count <= N_PTRS);
 		if (rand < data_p->count) {
 			assert(data_p->count > 0);
+			if (i % 2 == 0) {
+				void *p = realloc(data_p->ptrs[rand],
+				    17 + (i % 16) * 16);
+				assert_ptr_not_null(p,
+				    "Unexpected realloc failure in stress test");
+				data_p->ptrs[rand] = p;
+				continue;
+			}
 			if (rand != data_p->count - 1) {
 				assert(data_p->count > 1);
 				void *temp = data_p->ptrs[rand];
@@ -698,5 +977,7 @@ int
 main(void) {
 	return test(test_confirm_setup, test_prof_recent_off,
 	    test_prof_recent_on, test_prof_recent_alloc,
-	    test_prof_recent_alloc_dump, test_prof_recent_stress);
+	    test_prof_recent_alloc_dump, test_prof_recent_realloc_failure,
+	    test_prof_recent_realloc_success, test_prof_recent_realloc_shared_tctx,
+	    test_prof_recent_realloc_pending, test_prof_recent_stress);
 }

@@ -348,7 +348,7 @@ prof_lookup(tsd_t *tsd, prof_bt_t *bt) {
 	malloc_mutex_lock(tsd_tsdn(tsd), tdata->lock);
 	not_found = ckh_search(&tdata->bt2tctx, bt, NULL, &ret.v);
 	if (!not_found) { /* Note double negative! */
-		ret.p->prepared = true;
+		++ret.p->prepared_count;
 	}
 	malloc_mutex_unlock(tsd_tsdn(tsd), tdata->lock);
 	if (not_found) {
@@ -382,7 +382,7 @@ prof_lookup(tsd_t *tsd, prof_bt_t *bt) {
 		memset(&ret.p->cnts, 0, sizeof(prof_cnt_t));
 		ret.p->gctx = gctx;
 		ret.p->tctx_uid = tdata->tctx_uid_next++;
-		ret.p->prepared = true;
+		ret.p->prepared_count = 1;
 		ret.p->state = prof_tctx_state_initializing;
 		malloc_mutex_lock(tsd_tsdn(tsd), tdata->lock);
 		error = ckh_insert(tsd, &tdata->bt2tctx, btkey, ret.v);
@@ -1325,7 +1325,7 @@ prof_tctx_should_destroy(tsd_t *tsd, prof_tctx_t *tctx) {
 	if (tctx->cnts.curobjs != 0) {
 		return false;
 	}
-	if (tctx->prepared) {
+	if (tctx->prepared_count != 0) {
 		return false;
 	}
 	if (tctx->recent_count != 0) {

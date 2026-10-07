@@ -1501,13 +1501,17 @@ irallocx_prof(tsd_t *tsd, void *old_ptr, size_t old_usize, size_t size,
     size_t alignment, size_t usize, bool zero, tcache_t *tcache, arena_t *arena,
     emap_alloc_ctx_t *alloc_ctx) {
 	prof_info_t old_prof_info;
-	prof_info_get_and_reset_recent(tsd, old_ptr, alloc_ctx, &old_prof_info);
+	/*
+	 * Keep recent attached until success.  Moving paths reset it before
+	 * freeing old_ptr; the in-place path resets it below.
+	 */
+	prof_info_get(tsd, old_ptr, alloc_ctx, &old_prof_info);
 	bool         prof_active = prof_active_get_unlocked();
 	bool         sample_event = prof_sample_lookahead(tsd, usize);
 	prof_tctx_t *tctx = prof_alloc_prep(tsd, prof_active, sample_event);
 	void        *p;
 	/*
-	 * Retire the old sample before old_ptr can be freed and its address
+	 * Emit the USDT free event before old_ptr can be freed and its address
 	 * reused by another thread.  If the realloc then fails, the object
 	 * stays live but has already been reported as freed.  Emitting only
 	 * on success would require passing the sampled state down the realloc
@@ -1529,6 +1533,9 @@ irallocx_prof(tsd_t *tsd, void *old_ptr, size_t old_usize, size_t size,
 		return NULL;
 	}
 	assert(usize == isalloc(tsd_tsdn(tsd), p));
+	if (p == old_ptr && prof_tctx_is_valid(old_prof_info.alloc_tctx)) {
+		arena_prof_recent_alloc_reset(tsd_tsdn(tsd), old_ptr);
+	}
 	prof_realloc(tsd, p, size, usize, tctx, prof_active, old_ptr, old_usize,
 	    &old_prof_info, sample_event);
 

@@ -197,6 +197,7 @@ iralloct_realign(tsdn_t *tsdn, void *ptr, size_t oldsize, size_t size,
 	 */
 	copysize = (size < oldsize) ? size : oldsize;
 	memcpy(p, ptr, copysize);
+	arena_prof_recent_alloc_reset(tsdn, ptr);
 	isdalloct(tsdn, ptr, oldsize, tcache, NULL, true);
 	return p;
 }

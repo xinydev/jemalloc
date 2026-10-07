@@ -111,7 +111,8 @@ prof_alloc_rollback(tsd_t *tsd, prof_tctx_t *tctx) {
 		 */
 		assert(tctx != NULL);
 		malloc_mutex_lock(tsd_tsdn(tsd), tctx->tdata->lock);
-		tctx->prepared = false;
+		assert(tctx->prepared_count > 0);
+		--tctx->prepared_count;
 		prof_tctx_try_destroy(tsd, tctx);
 	}
 }
@@ -193,7 +194,8 @@ prof_malloc_sample_object(
 		tctx->cnts.accumbytes_unbiased += unbiased_bytes;
 	}
 	bool record_recent = prof_recent_alloc_prepare(tsd, tctx);
-	tctx->prepared = false;
+	assert(tctx->prepared_count > 0);
+	--tctx->prepared_count;
 	malloc_mutex_unlock(tsd_tsdn(tsd), tctx->tdata->lock);
 	if (record_recent) {
 		assert(tctx == edata_prof_tctx_get(edata));

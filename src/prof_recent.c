@@ -220,7 +220,9 @@ prof_recent_alloc_reset(tsd_t *tsd, edata_t *edata) {
 	if (dalloc_tctx != NULL) {
 		malloc_mutex_lock(tsd_tsdn(tsd), dalloc_tctx->tdata->lock);
 		increment_recent_count(tsd, dalloc_tctx);
-		dalloc_tctx->prepared = false;
+		/* Only consume this lookup; realloc may still need the tctx. */
+		assert(dalloc_tctx->prepared_count > 0);
+		--dalloc_tctx->prepared_count;
 		malloc_mutex_unlock(tsd_tsdn(tsd), dalloc_tctx->tdata->lock);
 	}
 

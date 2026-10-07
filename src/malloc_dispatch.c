@@ -112,6 +112,7 @@ malloc_dispatch_ralloc(tsdn_t *tsdn, arena_t *arena, void *ptr, size_t oldsize,
 	 */
 	size_t copysize = (usize < oldsize) ? usize : oldsize;
 	memcpy(ret, ptr, copysize);
+	arena_prof_recent_alloc_reset(tsdn, ptr);
 	isdalloct(tsdn, ptr, oldsize, tcache, NULL, true);
 	return ret;
 }

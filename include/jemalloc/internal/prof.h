@@ -191,10 +191,12 @@ struct prof_tctx_s {
 	rb_node(prof_tctx_t) tctx_link;
 
 	/*
-	 * True during prof_alloc_prep()..prof_malloc_sample_object(), prevents
-	 * sample vs destroy race.
+	 * Outstanding prof_lookup() results keep this context alive until
+	 * allocation, rollback, or recent deallocation recording consumes them.
+	 * Realloc's allocation and deallocation backtraces may share a context.
+	 * Protected by tdata->lock.
 	 */
-	bool prepared;
+	unsigned prepared_count;
 
 	/* Current dump-related state, protected by gctx->lock. */
 	prof_tctx_state_t state;

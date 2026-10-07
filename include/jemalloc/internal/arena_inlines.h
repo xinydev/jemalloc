@@ -246,6 +246,20 @@ arena_prof_info_get(tsd_t *tsd, const void *ptr, emap_alloc_ctx_t *alloc_ctx,
 }
 
 JEMALLOC_ALWAYS_INLINE void
+arena_prof_recent_alloc_reset(tsdn_t *tsdn, const void *ptr) {
+	/*
+	 * Called only after realloc succeeds, before the old extent can be
+	 * freed or its profiling metadata replaced.  Do not require prof_active:
+	 * sampling may have been disabled since this object was allocated.
+	 */
+	if (config_prof && opt_prof && !tsdn_null(tsdn)
+	    && ((uintptr_t)ptr & PROF_SAMPLE_ALIGNMENT_MASK) == 0) {
+		prof_info_t prof_info;
+		arena_prof_info_get(tsdn_tsd(tsdn), ptr, NULL, &prof_info, true);
+	}
+}
+
+JEMALLOC_ALWAYS_INLINE void
 arena_prof_tctx_reset(
     tsd_t *tsd, const void *ptr, emap_alloc_ctx_t *alloc_ctx) {
 	cassert(config_prof);
