@@ -93,13 +93,29 @@ tcache_gc_is_addr_remote(void *addr, uintptr_t min, uintptr_t max) {
 	return ((uintptr_t)addr < min || (uintptr_t)addr >= max);
 }
 
+static inline cache_bin_sz_t
+tcache_gc_count_remote(cache_bin_t *cache_bin, uintptr_t min, uintptr_t max) {
+	cache_bin_sz_t ncached = cache_bin_ncached_get_local(cache_bin);
+	void         **head = cache_bin->stack_head;
+	if (ncached == 1) {
+		return tcache_gc_is_addr_remote(head[0], min, max);
+	}
+
+	/* A wrapped half-open range is empty. */
+	uintptr_t width = max < min ? 0 : max - min;
+	unsigned  nremote = 0;
+	for (unsigned i = 0; i < ncached; i++) {
+		assert(head[i] != NULL);
+		nremote += (uintptr_t)head[i] - min >= width;
+	}
+	assert(nremote <= ncached);
+	return (cache_bin_sz_t)nremote;
+}
+
 JET_EXTERN_INLINE cache_bin_sz_t
 tcache_gc_small_nremote_get(cache_bin_t *cache_bin, void *addr,
     uintptr_t *addr_min, uintptr_t *addr_max, szind_t szind, size_t nflush) {
 	assert(addr != NULL && addr_min != NULL && addr_max != NULL);
-	/* The slab address range that the provided addr belongs to. */
-	uintptr_t slab_min = (uintptr_t)addr;
-	uintptr_t slab_max = slab_min + bin_infos[szind].slab_size;
 	/*
 	 * When growing retained virtual memory, it's increased exponentially,
 	 * starting from 2M, so that the total number of disjoint virtual
@@ -113,28 +129,12 @@ tcache_gc_small_nremote_get(cache_bin_t *cache_bin, void *addr,
 	    ? ((uintptr_t)addr + TCACHE_GC_NEIGHBOR_LIMIT)
 	    : UINTPTR_MAX;
 
-	/* Scan the entire bin to count the number of remote pointers. */
-	void         **head = cache_bin->stack_head;
-	cache_bin_sz_t n_remote_slab = 0, n_remote_neighbor = 0;
-	cache_bin_sz_t ncached = cache_bin_ncached_get_local(cache_bin);
-	for (void **cur = head; cur < head + ncached; cur++) {
-		n_remote_slab += (cache_bin_sz_t)tcache_gc_is_addr_remote(
-		    *cur, slab_min, slab_max);
-		n_remote_neighbor += (cache_bin_sz_t)tcache_gc_is_addr_remote(
-		    *cur, neighbor_min, neighbor_max);
-	}
-	/*
-	 * Note: since slab size is dynamic and can be larger than 2M, i.e.
-	 * TCACHE_GC_NEIGHBOR_LIMIT, there is no guarantee as to which of
-	 * n_remote_slab and n_remote_neighbor is greater.
-	 */
-	assert(n_remote_slab <= ncached && n_remote_neighbor <= ncached);
 	/*
 	 * We first consider keeping ptrs from the neighboring addr range,
 	 * since in most cases the range is greater than the slab range.
-	 * So if the number of non-neighbor ptrs is more than the intended
-	 * flush amount, we use it as the anchor for flushing.
 	 */
+	cache_bin_sz_t n_remote_neighbor =
+	    tcache_gc_count_remote(cache_bin, neighbor_min, neighbor_max);
 	if (n_remote_neighbor >= nflush) {
 		*addr_min = neighbor_min;
 		*addr_max = neighbor_max;
@@ -144,9 +144,11 @@ tcache_gc_small_nremote_get(cache_bin_t *cache_bin, void *addr,
 	 * We then consider only keeping ptrs from the local slab, and in most
 	 * cases this is stricter, assuming that slab < 2M is the common case.
 	 */
+	uintptr_t slab_min = (uintptr_t)addr;
+	uintptr_t slab_max = slab_min + bin_infos[szind].slab_size;
 	*addr_min = slab_min;
 	*addr_max = slab_max;
-	return n_remote_slab;
+	return tcache_gc_count_remote(cache_bin, slab_min, slab_max);
 }
 
 /* Shuffle the ptrs in the bin to put the remote pointers at the bottom. */

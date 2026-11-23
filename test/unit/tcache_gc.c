@@ -79,6 +79,19 @@ TEST_BEGIN(test_tcache_gc_small_remote_count_and_shuffle) {
 		bool success;
 		cache_bin_alloc(&bin, &success);
 	}
+	/* The slab end is still within the neighbor range. */
+	void *edge = (void *)(anchor + slab_size);
+	cache_bin_fill_ptrs(&bin, &edge, 1);
+	nremote = tcache_gc_small_nremote_get(&bin, (void *)anchor,
+	    &addr_min, &addr_max, szind, 0);
+	expect_zu_eq(0, nremote, "Expected neighbor range for zero target");
+	nremote = tcache_gc_small_nremote_get(&bin, (void *)anchor,
+	    &addr_min, &addr_max, szind, 1);
+	expect_zu_eq(1, nremote, "The slab should exclude its upper bound");
+	bool success;
+	expect_ptr_eq(
+	    edge, cache_bin_alloc(&bin, &success), "Expected singleton");
+
 	cache_bin_fill_ptrs(&bin, ptrs, 4);
 	nremote = tcache_gc_small_nremote_get(&bin, (void *)anchor,
 	    &addr_min, &addr_max, szind, 1);
